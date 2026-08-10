@@ -1,90 +1,120 @@
 # @Configuration、CGLIB代理与@Bean方法调用原理
 
-## 1. CGLIB是什么？
 
-CGLIB不是动态代理本身，而是**动态代理的一种实现方式**。
+# 1. CGLIB是什么？
 
-动态代理：
+CGLIB（Code Generation Library）是一种动态代理实现方式。
 
-```
+动态代理主要有两种：
+
 动态代理
+│
 ├── JDK动态代理
-│      └── 基于接口
+│ └── 基于接口
 │
 └── CGLIB动态代理
-       └── 基于继承
+└── 基于继承
+
 ```
+## JDK动态代理
 
-------
+特点：
 
-## 2. JDK动态代理 vs CGLIB
+- 基于接口实现
+- 生成接口实现类
+- 目标类必须实现接口
 
-|          | JDK动态代理    | CGLIB动态代理             |
-| -------- | -------------- | ------------------------- |
-| 实现方式 | 生成接口实现类 | 生成目标类子类            |
-| 要求     | 必须有接口     | 不需要接口                |
-| 原理     | implements接口 | extends目标类             |
-| 限制     | 接口方法       | 不能代理final类/final方法 |
 
-------
-
-### JDK动态代理
-
-目标：
+例如：
 
 ```java
-interface UserService {
+public interface UserService {
+
     void save();
+
 }
 ```
 
-Spring生成：
+目标类：
+
+```java
+public class UserServiceImpl implements UserService {
+
+    public void save(){
+
+    }
+
+}
+```
+
+Spring生成代理：
 
 ```java
 class UserServiceProxy implements UserService {
 
+
+    private UserService target;
+
+
     public void save(){
+
         //增强逻辑
+
         target.save();
+
     }
+
 }
 ```
 
 结构：
 
 ```
+调用方
+
+  ↓
+
 代理对象
-    |
-    ↓
-接口
-    |
-    ↓
+
+  ↓
+
 目标对象
 ```
 
 ------
 
-### CGLIB动态代理
+# 2. CGLIB动态代理
 
-目标：
+CGLIB基于继承生成目标类的子类。
+
+目标类：
 
 ```java
-class UserService {
+public class UserService {
+
 
     public void save(){
+
     }
+
 }
 ```
 
-Spring生成：
+生成：
 
 ```java
-class UserService$$CGLIB extends UserService {
+class UserService$$Enhancer extends UserService {
 
+
+    @Override
     public void save(){
+
         //增强逻辑
+
         super.save();
+
     }
+
 }
 ```
 
@@ -92,94 +122,69 @@ class UserService$$CGLIB extends UserService {
 
 ```
 代理对象
-    |
-    ↓
+
+   ↓
+
 继承目标类
-    |
-    ↓
-目标对象
 ```
+
+特点：
+
+- 不需要接口
+- 通过继承实现
+- 不能代理final类
+- 不能代理final方法
 
 ------
 
 # 3. @Configuration为什么需要CGLIB？
 
-## 问题背景
-
-Spring中：
+Spring配置类：
 
 ```java
 @Configuration
 public class MainConfig {
 
+
     @Bean
     public UserService userService(){
+
         return new UserService(roleService());
+
     }
 
 
     @Bean
     public RoleService roleService(){
+
         return new RoleService();
+
     }
-}
-```
-
-看起来：
-
-```java
-roleService()
-```
-
-应该返回Spring容器里的Bean。
-
-但是实际上：
-
-## Java层面
-
-Java不知道：
-
-```java
-@Bean
-```
-
-这个注解。
-
-对于Java来说：
-
-```java
-userService(){
-
-    return new UserService(roleService());
 
 }
 ```
 
-就是普通方法调用：
+目标：
+
+保证：
 
 ```
-userService()
-        |
-        ↓
-this.roleService()
-        |
-        ↓
-new RoleService()
+@Bean方法返回的是Spring容器中的同一个Bean
 ```
 
 ------
 
 # 4. 不使用CGLIB会发生什么？
 
-假设关闭：
+配置：
 
 ```java
 @Configuration(proxyBeanMethods = false)
 ```
 
-Spring执行：
+此时：
 
-## 创建UserService
+@Bean方法就是普通Java方法。
 
 调用：
 
@@ -187,88 +192,72 @@ Spring执行：
 userService()
 ```
 
+Java执行：
+
+```java
+return new UserService(roleService());
+```
+
 内部：
 
 ```java
-new UserService(roleService());
+roleService()
 ```
 
-执行：
+等价：
 
 ```java
-new RoleService();
+this.roleService();
 ```
 
-得到：
+普通Java认为：
+
+```
+调用当前对象的方法
+```
+
+于是：
+
+创建：
 
 ```
 RoleService对象A
 ```
 
-然后：
-
-```
-UserService
-      |
-      |
-      RoleService A
-```
-
-------
-
-## 创建RoleService Bean
-
-Spring发现：
+之后Spring创建：
 
 ```java
 @Bean
 public RoleService roleService()
 ```
 
-再次调用：
-
-```java
-roleService()
-```
-
-创建：
+又创建：
 
 ```
 RoleService对象B
 ```
 
-注册：
+最终：
 
 ```
 Spring容器:
 
-UserService
-RoleService B
+RoleService Bean(B)
+
+
+UserService:
+
+    |
+    ↓
+
+RoleService A
 ```
+
+出现两个对象。
 
 ------
 
-最终：
-
-```
-Spring容器
-
-UserService
-      |
-      |
-      RoleService A
-      （普通对象，不是Bean）
-
-
-RoleService B
-      （Spring Bean）
-```
-
-出现两个RoleService。
-
-------
-
-# 5. @Configuration的CGLIB代理解决问题
+# 5. @Configuration + CGLIB如何解决？
 
 默认：
 
@@ -288,7 +277,29 @@ MainConfig
 MainConfig$$EnhancerByCGLIB
 ```
 
+类似：
+
+```java
+class MainConfig$$Enhancer extends MainConfig {
+
+
+    @Override
+    public RoleService roleService(){
+
+        return beanFactory.getBean(RoleService.class);
+
+    }
+
+}
+```
+
+也就是说：
+
+Spring重写了@Bean方法。
+
 ------
+
+# 6. @Configuration内部this为什么有效？
 
 调用：
 
@@ -296,96 +307,126 @@ MainConfig$$EnhancerByCGLIB
 userService()
 ```
 
-实际上：
+执行流程：
 
 ```
-代理配置类
-       |
-       ↓
+MainConfig增强对象
+
+        ↓
+
 userService()
-       |
-       ↓
-调用roleService()
-       |
-       ↓
-CGLIB拦截
-       |
-       ↓
-Spring容器.getBean(RoleService)
-       |
-       ↓
+
+        ↓
+
+this.roleService()
+
+        ↓
+
+增强后的roleService()
+
+        ↓
+
+Spring容器.getBean()
+
+        ↓
+
 返回已有Bean
 ```
 
-于是：
+关键：
+
+这里：
+
+```java
+this
+```
+
+指向：
 
 ```
-UserService
-      |
-      |
-      RoleService Bean
+MainConfig$$Enhancer
 ```
 
-保证单例。
+不是原来的：
+
+```
+MainConfig
+```
+
+所以：
+
+```java
+this.roleService()
+```
+
+实际调用：
+
+```
+增强后的方法
+```
+
+保证：
+
+```
+@Bean单例
+```
 
 ------
 
-# 6. 关键理解：不是所有new都会被代理
+# 7. CGLIB不是拦截所有new
 
 错误理解：
 
-> CGLIB会把所有new对象改成从Spring容器获取
-
-错误。
+> CGLIB会把所有new对象替换成Spring Bean
 
 正确：
 
-> CGLIB只拦截@Configuration类内部对@Bean方法的调用。
-
-------
+> CGLIB只增强@Configuration类中的@Bean方法调用。
 
 例如：
 
-## 会被处理
+## 会被增强
 
 ```java
 @Bean
 public RoleService roleService(){
+
     return new RoleService();
+
 }
 ```
 
 调用：
 
-```java
-roleService();
+```
+roleService()
 ```
 
-会被代理。
+会进入CGLIB增强逻辑。
 
 ------
 
-## 不会被处理
+## 不会被增强
 
 ```java
 public void test(){
 
-    RoleService service = new RoleService();
+    RoleService roleService = new RoleService();
 
 }
 ```
 
 这里：
 
-```java
+```
 new RoleService()
 ```
 
-Spring完全不知道。
+Spring不知道。
 
 ------
 
-# 7. 为什么@Autowired不用CGLIB？
+# 8. 为什么@Autowired不用CGLIB？
 
 例如：
 
@@ -397,30 +438,28 @@ private RoleService roleService;
 流程：
 
 ```
-对象创建
-    |
-    ↓
+创建对象
+
+↓
+
 Spring容器查找Bean
-    |
-    ↓
-注入对象
+
+↓
+
+注入Bean
 ```
 
-本来就是从容器获取。
+本身已经是：
 
-不需要代理。
+```
+从Spring容器获取对象
+```
 
-------
-
-# 8. @Configuration代理的核心作用
-
-一句话：
-
-> @Configuration通过CGLIB代理拦截配置类内部@Bean方法调用，将普通Java方法调用转换为Spring容器Bean查找，从而保证@Bean方法返回的对象是同一个单例Bean。
+不需要代理方法调用。
 
 ------
 
-# 9. @Transactional为什么不能解决this调用？
+# 9. @Configuration和@Transactional区别
 
 虽然：
 
@@ -434,114 +473,347 @@ Spring容器查找Bean
 @Transactional
 ```
 
-都使用代理。
+都可能使用CGLIB。
 
-但是目的不同。
+但是作用完全不同。
 
 ------
 
-## @Configuration
-
-代理：
-
-```
-配置类
-```
+# 10. @Configuration代理
 
 目的：
 
 ```
-保证@Bean单例
+保证@Bean方法返回Spring Bean
 ```
 
-处理：
+增强对象：
 
 ```
-@Bean方法调用
+@Configuration类本身
 ```
+
+结构：
+
+```
+MainConfig$$Enhancer
+
+        ↓
+
+作为Bean使用
+```
+
+所以：
+
+```java
+this.bean()
+```
+
+可以进入增强方法。
 
 ------
 
-## @Transactional
-
-代理：
-
-```
-业务Bean
-```
+# 11. @Transactional代理
 
 目的：
 
 ```
-添加事务增强
+给方法添加事务能力
+```
+
+Spring AOP结构：
+
+```
+调用方
+
+ ↓
+
+代理对象(proxy)
+
+ ↓
+
+事务拦截器
+
+ ↓
+
+目标对象(target)
+```
+
+例如：
+
+```java
+@Service
+public class UserService {
+
+
+    public void a(){
+
+        this.b();
+
+    }
+
+
+    @Transactional
+    public void b(){
+
+    }
+
+}
+```
+
+调用：
+
+```java
+userService.a();
+```
+
+其中：
+
+```
+userService
+```
+
+实际上是：
+
+```
+proxy
+```
+
+执行：
+
+```
+proxy.a()
+
+↓
+
+事务拦截器
+
+↓
+
+target.a()
+
+↓
+
+this.b()
+
+↓
+
+target.b()
+```
+
+这里：
+
+```
+this = target
+```
+
+所以：
+
+```
+target.b()
+```
+
+不会经过：
+
+```
+proxy.b()
+```
+
+因此：
+
+```
+@Transactional失效
+```
+
+------
+
+# 12. 为什么外部直接调用事务方法有效？
+
+调用：
+
+```java
+userService.b();
+```
+
+实际上：
+
+```
+proxy.b()
 ```
 
 流程：
 
 ```
-调用方
- |
- ↓
-代理对象
- |
- ↓
+proxy.b()
+
+↓
+
 事务拦截器
- |
- ↓
-目标方法
+
+↓
+
+target.b()
+```
+
+因为经过代理：
+
+```
+@Transactional生效
 ```
 
 ------
 
-但是：
+# 13. 内部调用和外部调用区别
+
+## 外部调用
+
+代码：
 
 ```java
-public void test(){
-
-    save();
-
-}
+userService.b();
 ```
 
-内部调用：
+对象：
 
 ```
-this.save()
+proxy
 ```
 
-绕过代理。
-
-所以：
+流程：
 
 ```
-事务失效
+proxy
+
+↓
+
+事务增强
+
+↓
+
+target
+```
+
+结果：
+
+```
+事务生效
 ```
 
 ------
 
-# 10. 最终总结
+## 内部调用
 
-| 问题                               | 答案                   |
-| ---------------------------------- | ---------------------- |
-| CGLIB是什么？                      | 动态代理实现方式       |
-| CGLIB代理什么？                    | 目标类子类             |
-| @Configuration为什么用CGLIB？      | 拦截@Bean方法调用      |
-| 为什么需要拦截？                   | 避免内部调用创建新对象 |
-| 所有new都会被拦截吗？              | 不会                   |
-| 哪些会被拦截？                     | 调用@Bean方法          |
-| @Autowired为什么不用？             | 本身就是容器获取       |
-| @Transactional为什么this调用失效？ | 内部调用绕过代理       |
+代码：
 
-核心记忆：
+```java
+this.b();
+```
+
+对象：
 
 ```
-@Bean方法
-    ↓
-普通Java调用
-    ↓
-@Configuration + CGLIB拦截
-    ↓
-Spring容器获取Bean
-    ↓
+target
+```
+
+流程：
+
+```
+target
+
+↓
+
+target.b()
+```
+
+结果：
+
+```
+绕过代理
+
+事务不生效
+```
+
+------
+
+# 14. 核心区别总结
+
+|          | @Configuration   | @Transactional |
+| -------- | ---------------- | -------------- |
+| 实现方式 | CGLIB增强        | JDK/CGLIB代理  |
+| 增强对象 | 配置类本身       | 业务Bean代理   |
+| 主要目的 | 保证@Bean单例    | 添加事务       |
+| 调用对象 | 增强后的对象     | proxy + target |
+| this指向 | 增强对象         | target         |
+| 内部调用 | 可以进入增强逻辑 | 绕过代理       |
+| 解决问题 | Bean创建控制     | 方法执行增强   |
+
+------
+
+# 15. 最终记忆
+
+## @Configuration
+
+```
+@Bean方法调用
+
+↓
+
+@Configuration CGLIB增强
+
+↓
+
+this指向增强对象
+
+↓
+
+调用Spring容器
+
+↓
+
+返回已有Bean
+
+↓
+
 保证单例
 ```
+
+## @Transactional
+
+```
+外部调用
+
+↓
+
+代理对象
+
+↓
+
+事务拦截器
+
+↓
+
+目标对象
+
+↓
+
+业务方法
+
+
+内部this调用
+
+↓
+
+目标对象直接调用
+
+↓
+
+绕过代理
+
+↓
+
+事务增强失效
+```
+
+一句话总结：
+
+> @Configuration通过CGLIB直接增强配置类对象，修改@Bean方法调用逻辑，使内部this调用能够进入Spring容器；@Transactional通过AOP代理包装业务对象，业务方法运行在target对象中，内部this调用不会经过代理，因此无法触发事务增强。
