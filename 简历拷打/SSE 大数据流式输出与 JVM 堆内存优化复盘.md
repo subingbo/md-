@@ -1,8 +1,8 @@
 # SSE 大数据流式输出与 JVM 堆内存优化复盘
 
 > 主题：Spring MVC `SseEmitter`、Jackson 序列化、Java 21 `String` 内部存储、`byte[]` / `char[]`、Heap Dump 与 JFR  
-> 记录依据：本次对话中的代码、实验数据和排查记录。  
-> 阅读原则：本文把**实测事实、机制解释、待验证假设**分开写。凡是没有通过实际 Spring Converter、JFR 分配栈或 MAT 引用链确认的内容，不作为确定结论。
+> 记录依据：2026-10-19 峰值对照、2026-11-05 堆快照对照、2026-11-06 JFR 分配栈对照的实测数据与排查记录。  
+> 阅读原则：本文把**实测事实、机制解释**分开写。凡是没有通过实际 Spring Converter、JFR 分配栈或 MAT 引用链确认的内容，明确标注为推测。
 
 ---
 
@@ -50,7 +50,12 @@ HTTP/SSE 输出流
 
 两条路径都需要把响应内容编码为网络字节。新路径省掉的是**先构造完整 JSON String 这一中间物化步骤**，以及旧路径可能伴随的完整 String 编码副本和相关临时数组分配。
 
-目前的实验已经证明：在 2026-11-05 的堆快照中，`byte[]` 和 `char[]` 的总量明显减少。但要把每一类数组精确归因到某个类或方法，还需要继续检查 MAT 引用链和 JFR 分配调用栈。
+目前的实验已经证明：
+
+1. 2026-11-05 堆快照：`byte[]` 从 307.5 MB 降至 67.7 MB，`char[]` 从 110.1 MB 降至 56.4 MB，合计减少 293.5 MB（快照时堆用量差 315 MB）。
+2. 2026-11-06 JFR 分配栈对照（逐次分配事件，非抽样）：同一请求下，旧路径 `byte[]`+`char[]` 域外分配合计 905.7 MB，新路径 110.2 MB，差额约 795 MB，并且能精确落到三条调用栈上——Spring `StringHttpMessageConverter` 的二次 UTF-8 编码（约 293 MB）、Jackson `TextBuffer.contentsAsString` 拼 String（约 364 MB）、Jackson `TextBuffer` 字符缓冲（约 135 MB）。
+
+结论：省掉的不是一个 String 对象，而是每条大事件发送时的四五次整包数组拷贝。
 
 ---
 
@@ -252,7 +257,7 @@ Histogram 只告诉我们 `char[]` 类实例的总量，不会自动告诉我们
 
 要证明某一块 `char[]` 属于 Jackson `TextBuffer`，需要查看该数组的具体实例和 Incoming References / 引用链。
 
-因此，当前可以说“`char[]` 与 Jackson 字符缓冲区机制相符”，但不能仅凭 Histogram 断言所有 `char[]` 都来自 `TextBuffer`。
+**2026-11-06 已用 JFR 分配栈证明**：直接写入路径中约 53.4 MB 的 `char[]` 来自 Kingbase JDBC `UTF8Encoding.decode`（读库解码），旧路径额外多出约 135 MB 的 `char[]` 全部来自 `TextBuffer.carr/expand`（`SegmentedStringWriter.write` 之上，含 `_writeLongString` 与 `_writeString2` 两条入口）。也就是说，`char[]` 的两个来源都被逐栈确认了，不再依赖类名推断。
 
 ### 4.3 直接写对象时仍然需要缓冲区
 
@@ -333,15 +338,17 @@ StringHttpMessageConverter
 OutputStream
 ```
 
-**这是一个合理且值得验证的解释，但还不能仅凭当前代码就断言项目一定走了这条具体转换器路径。**
+**这一条已经由 JFR 分配栈证实（2026-11-06）**。旧路径录制中最大的一条 `byte[]` 分配栈是：
 
-实际结果取决于：
+```text
+java/lang/String.getBytes
+  <- org/springframework/util/StreamUtils.copy
+  <- org/springframework/http/converter/StringHttpMessageConverter.writeInternal
+```
 
-- Spring Framework / Spring Boot 版本；
-- 项目是否自定义 `HttpMessageConverter`；
-- 转换器注册顺序；
-- 每个转换器的 `canWrite()` 结果；
-- 实际 `SseEmitter` 写出实现。
+该栈在旧路径下累计分配 218.9 MB `byte[]`（另有同一 encode 路径内部的 `Arrays.copyOf` 74.2 MB），而直接写流路径完全没有这条栈。也就是说本项目实际就是由 `StringHttpMessageConverter` 处理 String + `application/json`，并且每次发送都把整个 JSON String 再编码成一份新的 UTF-8 `byte[]`。
+
+差额的其余部分也已被逐栈确认（见第 8.3 节），不再需要打印 converter 列表来间接推断。
 
 ### 5.3 如何检查项目实际注册的转换器
 
@@ -503,6 +510,55 @@ Histogram 结果：
 
 两轮数据可以共同支持“直接写入显著降低了 SSE 堆压力”这一判断，但对象级归因必须使用各自同一轮的快照证据。
 
+### 8.3 2026-11-06：JFR 分配栈对照（本次归因的关键证据）
+
+同一请求（直连 8108，bbox `[35138.4423, 224812.4682, 64785.6564, 254459.6822]`），响应都是 77,963,820 字节，分别部署旧包（`writeValueAsString`）与新包（直接写流），用 JFR `settings=profile` 外加手动启用 `jdk.ObjectAllocationOutsideTLAB` 录制全程，逐次统计（非抽样）：
+
+| 路径 | `byte[]` 域外分配 | `char[]` 域外分配 | 合计 |
+|---|---:|---:|---:|
+| 旧方案 `writeValueAsString` | 713.1 MB | 192.6 MB | **905.7 MB** |
+| 新方案直接写流 | 56.4 MB | 53.8 MB | **110.2 MB** |
+
+两边共有的部分就是读库本身的固定开销（旧/新几乎一致）：
+
+| 调用栈 | 旧路径 | 新路径 |
+|---|---:|---:|
+| Kingbase `UTF8Encoding.decode` 的 `char[]` | 53.4 MB | 53.4 MB |
+| `KBStream.receiveTupleV3` 读缓冲 `byte[]` | 27.9 MB | 28.2 MB |
+| 解码后 `StringUTF16.compress` 的 `byte[]` | 27.4 MB | 27.6 MB |
+| **读库小计** | **约 109 MB** | **约 109 MB** |
+
+也就是说新路径的 110.2 MB 几乎全部是读库开销；11-05 快照里直接写入路径剩余的 67.7 MB `byte[]`、56.4 MB `char[]`，对应的就是这三条栈。
+
+旧路径独有的三条栈（差额约 795 MB 的构成）：
+
+| # | 调用栈（截取） | 分配量 | 说明 |
+|---|---|---:|---|
+| 1 | `String.getBytes ← StreamUtils.copy ← StringHttpMessageConverter.writeInternal` | 218.9 + 74.2 = **293.1 MB** `byte[]` | Spring 把整个 JSON String **再编码一份 UTF-8** 才写网络 |
+| 2 | `AbstractStringBuilder.inflate ← StringBuilder.append ← TextBuffer.contentsAsString ← writeValueAsString` | **145.7 MB** `byte[]` | 拼 String 时的 UTF-16 展开 |
+| 3 | `Arrays.copyOfRange ← String.<init> ← StringBuilder.toString ← TextBuffer.contentsAsString` | **145.7 MB** `byte[]` | `toString` 的最终拷贝 |
+| 4 | `AbstractStringBuilder.<init> ← StringBuilder.<init> ← TextBuffer.contentsAsString` | **72.8 MB** `byte[]` | StringBuilder 本体 |
+| 5 | `TextBuffer.carr/expand ← SegmentedStringWriter.write`（`_writeLongString` / `_writeString2`） | 95.9 + 38.5 ≈ **135 MB** `char[]` | Jackson 的 UTF-16 序列化缓冲，翻倍扩容时旧块一并计入 |
+
+三条栈合计约 **790 MB**。以一条 28 MB 的事件为例：`char[]` 缓冲约 2 倍体积、UTF-16 展开一份、`toString` 一份、String 内部 `byte[]` 一份、`getBytes` 再一份，约等于事件体积的五六倍。这些数组全部大于 G1 humongous 阈值（区 1 MB 的一半），Young GC 不回收，请求期间逐条叠加，这正是 10-19 峰值差 424 MB 的来源；11-05 快照里的 293.5 MB 差额是 dump 那一刻仍驻留的子集。
+
+辅证（`jdk.ObjectAllocationSample`，300/s 抽样，只看相对构成）：旧路径 `byte[]` 854.2 MB + `char[]` 152.9 MB，直接路径 225.8 MB + 54.3 MB，最大栈与逐次统计一致。
+
+`HeapByteBuffer` 不是差额来源：抽样里旧路径只有约 2.3 MB（Tomcat `OutputBuffer` 包装输出分片），直接路径更少。MAT 里 3416 个不可达 `HeapByteBuffer` 共享同一份大 `byte[]`，它们是小对象包装，不能把数量乘上去。
+
+注意：OutsideTLAB 事件只覆盖 TLAB 之外的分配（大数组主要在这里），不是全部分配；JFR 录制本身会拖慢请求，本次耗时约 50 s（平时约 50–55 s），不影响结论，但不要用这次的耗时或峰值去更新 10-19 的数字。
+
+### 8.4 MAT 对这两份快照的处理记录
+
+两份 dump 均以 `GC.heap_dump -all=true` 生成（不做全量 GC，不可达对象保留在文件里）。MAT 默认在解析时删除不可达对象：
+
+| dump | MAT 日志 |
+|---|---|
+| 字符串序列化 | `Removed 263,539 unreachable objects using 403,054,760 bytes` |
+| 直接写流 | `Removed 333,147 unreachable objects using 93,850,904 bytes` |
+
+所以 MAT 概览上字符串那份只有 95.3 MB、最大保留对象是仍挂在数据库连接上的 Kingbase `KBStream`（保留 53.4 MB）。被删掉的约 384 MB 才是 `writeValueAsString` 产生的、已不可达但尚未被 GC 的数组。要看它们：`Keep unreachable objects` 勾选后必须 **Delete Index Files 再重新解析**（MAT 会复用旧索引，仅勾选不重解析无效）；保留不可达对象后用 Java Basics → GC Roots → Unreachable Objects 查看。
+
 ---
 
 ## 9. Histogram、Dominator Tree 和引用链分别解决什么问题
@@ -628,13 +684,23 @@ jcmd <PID> JFR.dump name=sse-test filename=D:\Temp\sse-test.jfr
 
 这会把记录导出到指定文件。
 
-查看分配采样事件：
+**JDK 21 的一个坑（本项目实测踩到）**：`settings=profile` 下 `jdk.ObjectAllocationOutsideTLAB` / `jdk.ObjectAllocationInNewTLAB` 默认是**关闭**的（JDK 16 起被 `jdk.ObjectAllocationSample` 取代），录出来是 0 条。要看大数组（humongous、TLAB 外）的逐次分配，必须在启动时追加事件级参数：
 
-```powershell
-jfr print --events jdk.ObjectAllocationSample D:\Temp\sse-test.jfr
+```text
+jcmd <PID> JFR.start name=sse settings=profile +jdk.ObjectAllocationOutsideTLAB#enabled=true
 ```
 
-注意：`jdk.ObjectAllocationSample` 是采样事件，不是每一次对象分配的完整清单。不能简单把采样事件大小相加，当成精确的总分配字节数。可以结合 JDK Mission Control 查看分配热点和调用栈；若需要更细粒度事件，应评估启用更详细分配事件的开销。
+本项目服务跑在公司 Docker 里，`jcmd` 不能从本机直发，实际用的是宿主机 `/tmp/jattach <hostJavaPid> jcmd '...'`，Java 宿主机 PID 取自 `docker top`（不是 `docker inspect State.Pid`，那是 shell 的 PID）；录制文件写在 JVM 可见的容器内 `/tmp`，再 `docker cp` 出来。
+
+`jdk.ObjectAllocationSample` 是采样事件（默认节流 300/s，`weight` 是加权估计），不能把事件大小相加当精确值；`jdk.ObjectAllocationOutsideTLAB` 的 `allocationSize` 是逐次精确值，适合按调用栈聚合。聚合方式：
+
+```powershell
+jfr print --json --stack-depth 24 --events jdk.ObjectAllocationOutsideTLAB file.jfr
+```
+
+然后按 `objectClass`（JSON 里原始数组类名是 `[B`、`[C`）+ 调用栈前几帧分组求和。注意 JSON 里事件体在 `values` 键下，帧的 `type` 字段是执行模式字符串（如 `Interpreted`），类名在 `method.type.name` 里。
+
+本项目两次录制的归档：`D:\Job\简历\数据` 下的 `sse-allocation-string.jfr`（旧路径）与 `sse-allocation-direct.jfr`（新路径）。
 
 JFR 与 MAT 的区别：
 
@@ -670,73 +736,29 @@ Wireshark / tcpdump 适合检查：
 | UTF-8 编码结果是字节，不是 String | **确定** |
 | 2026-11-05 两类数组合计减少 293.5 MB | **Histogram 实测** |
 | 2026-11-05 快照时堆用量相差 315 MB | **监控读数实测** |
-| `char[]` 全部来自 Jackson TextBuffer | **未证明** |
-| 剩余 67.7 MB `byte[]` 主要是 GeoJSON String 底层数组 | **当前记录中的归因，待引用链核实** |
-| 旧 String 路径由 `StringHttpMessageConverter` 处理 | **需检查实际 converter 配置和调用路径** |
-| 旧路径一定额外产生一份完整 UTF-8 byte[] | **合理假设，需 JFR / 源码路径验证** |
-| 239.8 MB 的 byte[] 差额全部是最终 JSON String 的 value | **不能这样下结论** |
-| 2026-10-19 的 424 MB 峰值差等于释放的对象大小 | **错误；它只是两次峰值读数之差** |
+| `char[]` 全部来自 Jackson TextBuffer | **已被 JFR 逐栈否定并修正**：`char[]` 有两个来源——直接路径约 53.4 MB 是 Kingbase 解码，旧路径额外约 135 MB 才是 TextBuffer |
+| 剩余 67.7 MB `byte[]` 主要是 GeoJSON String 底层数组 | **已由 JFR 栈定位**：直接路径的 `byte[]` 主要是 Kingbase 读缓冲与解码压缩（约 56 MB），与该归因一致 |
+| 旧 String 路径由 `StringHttpMessageConverter` 处理 | **已证实**：JFR 栈 `String.getBytes ← StreamUtils.copy ← StringHttpMessageConverter.writeInternal`，仅旧路径存在 |
+| 旧路径一定额外产生一份完整 UTF-8 byte[] | **已证实并量化**：218.9 + 74.2 ≈ 293 MB（逐次事件求和） |
+| 239.8 MB 的 byte[] 差额全部是最终 JSON String 的 value | **不能这样下结论**；差额是 String 构造链路 + 二次编码 + 缓冲扩张的叠加，快照只是其中仍驻留的部分 |
+| 2026-10-19 的 424 MB 峰值差等于释放的对象大小 | **错误；它只是两次峰值读数之差**。JFR 显示旧路径累计多分配约 790 MB，峰值差 424 MB 是这些 humongous 数组在峰值时刻仍驻留的部分 |
+| MAT 概览数字偏小（95.3 MB）是 dump 有问题 | **错误**；是 MAT 默认删除了不可达对象（字符串 dump 删掉约 384 MB），勾选 Keep unreachable + 删索引重解析即可看到 |
 
 ---
 
 ## 12. 下一步验证计划
 
-建议按以下顺序进行，不需要一开始就抓包。
+前三步已经完成（2026-11-06），保留记录如下：
 
-### 第一步：确认实际消息转换器
+- **第一步：确认实际消息转换器** —— 已由 JFR 栈直接证实：旧路径实际命中 `StringHttpMessageConverter`（`String.getBytes ← StreamUtils.copy ← writeInternal`，且该栈仅旧路径存在），不需要再打印 converter 列表。
+- **第二步：分别对旧路径和新路径录制 JFR** —— 已完成，方法与结果见第 8.3、10.2 节。
+- **第三步：对具体数组做 MAT 引用链分析** —— 核心部分已完成：不可达对象的类型构成（`byte[]` 307.5→67.7 MB、`char[]` 110.1→56.4 MB）与 JFR 分配栈互相印证；保留不可达对象后，可达的最大保留者是 Kingbase `KBStream`（53.4 MB），不属于差额来源。
+- **第四步：证据归档** —— `D:\Job\简历\数据` 下有两份 hprof.gz、两份 JFR 录制、MAT 索引与 Leak Suspects 报告；输入、响应字节数、耗时见 8.1–8.3。
 
-打印 `RequestMappingHandlerAdapter` 注册的转换器，检查：
+仍然可做的后续（非必需）：
 
-- String + `application/json` 哪些 converter 的 `canWrite()` 返回 true；
-- `BoxStreamLayerEventVO` + `application/json` 哪些 converter 的 `canWrite()` 返回 true；
-- converter 的顺序；
-- 是否有自定义 converter。
-
-再通过断点或日志确认实际发送时命中了哪个 converter。
-
-### 第二步：分别对旧路径和新路径录制 JFR
-
-保持相同：
-
-- Java 版本；
-- JVM 参数；
-- 输入数据；
-- 响应大小；
-- 并发数；
-- 服务配置；
-- 测试流程。
-
-重点查看：
-
-- `byte[]` 分配调用栈；
-- `char[]` 分配调用栈；
-- `String` 构造路径；
-- `StringHttpMessageConverter` 的编码路径（如果实际使用）；
-- Jackson Generator 的输出缓冲区分配路径。
-
-### 第三步：对具体数组做 MAT 引用链分析
-
-不要只看 Histogram 总量。分别从优化前后的大 `byte[]`、`char[]` 实例中抽样，查看：
-
-- 是否被 String 的 `value` 引用；
-- 是否被 Jackson TextBuffer / Generator 引用；
-- 是否被 Spring 输出或其他缓冲对象引用；
-- 是否已经不可达；
-- 是否被 ThreadLocal / BufferRecycler 等复用机制保留。
-
-### 第四步：重复测试并保留同一时刻证据
-
-建议保存：
-
-- 测试输入和响应字节数；
-- Heap Used 采样曲线；
-- Heap Dump；
-- JFR 文件；
-- Histogram 导出；
-- MAT 引用链截图或报告；
-- JVM 参数和 Spring 版本。
-
-这样后续可以把“峰值下降”与“具体对象分配减少”分别证明。
+- 在 MAT 中对直接写流路径的大 `byte[]` 实例逐个跑 Incoming References，把 67.7 MB 全部挂到 Kingbase 解码栈上（当前是 JFR 栈侧证明，对象级引用链未逐个展开）。
+- 如果要把 10-19 的 424 MB 峰值差也做成对象构成，需要在峰值时刻（而非请求结束后）用同样的 `-all=true` 方式抓快照，本次未做。
 
 ---
 
@@ -744,15 +766,15 @@ Wireshark / tcpdump 适合检查：
 
 ### 13.1 推荐的技术表述
 
-> 针对大数据量 SSE 返回过程中先将事件对象整体序列化为 JSON String、再交给 Spring 写出所产生的额外内存分配，将发送方式调整为直接传递事件 VO，由 Spring/Jackson 在响应写出阶段完成 JSON 序列化。Java 21 的 String 使用内部 `byte[]` 保存字符串内容，原先的完整字符串物化以及后续字符集编码可能形成额外数组分配。相同响应数据量的对照测试中，未先执行全量 GC 的堆快照显示，`byte[]` 从 307.5 MB 降至 67.7 MB，`char[]` 从 110.1 MB 降至 56.4 MB，两类数组合计减少 293.5 MB。
+> 针对大数据量 SSE 返回过程中先将事件对象整体序列化为 JSON String、再交给 Spring 写出所产生的额外内存分配，将发送方式调整为直接传递事件 VO，由 Spring/Jackson 在响应写出阶段完成 JSON 序列化。用 JFR 分配事件对照验证：同一请求下，旧路径 `byte[]`+`char[]` 的 TLAB 外分配合计 905.7 MB，新路径 110.2 MB；多出来的约 790 MB 落在三条栈上——`StringHttpMessageConverter` 对整个 JSON String 的二次 UTF-8 编码（约 293 MB）、Jackson `TextBuffer.contentsAsString` 构造 String 的 UTF-16 展开与拷贝（约 364 MB）、`TextBuffer` 字符缓冲（约 135 MB）。堆快照同样显示 `byte[]` 从 307.5 MB 降至 67.7 MB、`char[]` 从 110.1 MB 降至 56.4 MB。SSE 堆峰值从 679 MB 降到 255 MB，容器驻留从约 1.1 GB 降到约 630 MB。
 
-这段话描述了优化方式和实测数据，但没有声称 293.5 MB 全部来自某一个具体对象。
+这段话的每一处数字都有实测来源：JFR 逐次分配事件、堆快照 Histogram、峰值监控读数。
 
 ### 13.2 如果面试官问“为什么 byte[] 减少这么多”
 
 可以回答：
 
-> 原实现先通过 `writeValueAsString()` 构造完整 JSON String。Java 21 的 String 底层有自己的 `byte[]`；如果后续由 String 消息转换器按 UTF-8 写出，还可能再创建编码后的字节数组。与此同时，Jackson 的字符缓冲区和其他临时数组也会参与分配。连续处理大事件时，部分已经不可达的数组不会立即被 GC 回收，可能在快照时累积。改成对象直传后，不再需要完整 JSON String 这一层物化，减少了相关数组分配。具体每种数组的精确来源，还需要结合 JFR 分配栈和 MAT 引用链确认。
+> 原实现先通过 `writeValueAsString()` 构造完整 JSON String，这一步并不是只产生“一个 String 对象”。JFR 分配栈显示构造过程至少经过：Jackson `TextBuffer` 的 UTF-16 字符缓冲（约 135 MB `char[]`）、`contentsAsString` 时 `StringBuilder` 的 UTF-16 展开、`toString` 的最终拷贝和 String 压缩（合计约 364 MB `byte[]`）；然后 `StringHttpMessageConverter` 还要把整个 String 再 `getBytes(UTF-8)` 一份才能写网络（约 293 MB `byte[]`）。这些数组都超过 G1 的 humongous 阈值，Young GC 不回收，连续大事件会在 GC 前叠加。对象直传后 Jackson 边序列化边写出，这四类整包拷贝全部消失，两条路径剩下的都是读库本身约 109 MB 的分配。
 
 ### 13.3 如果面试官问“直接写入还需要 UTF-8 编码吗”
 
@@ -764,9 +786,15 @@ Wireshark / tcpdump 适合检查：
 
 回答：
 
-> Histogram 统计的是所有该类型数组的累计浅堆大小，不是单个元素大小。虽然 char 元素通常是 2 字节、byte 元素是 1 字节，但 byte[] 的数量和长度总和可能更大。另外 byte[] 可能来自 String 底层存储、输出缓冲区和其他字节数组，char[] 也可能来自 Jackson 字符缓冲区。需要看具体对象引用链，不能只凭类名判断用途。
+> Histogram 统计的是所有该类型数组的累计浅堆大小，不是单个元素大小。虽然 char 元素通常是 2 字节、byte 元素是 1 字节，但 byte[] 的数量和长度总和可能更大。JFR 分配栈也证实了具体来源：byte[] 的主体是 String 的二次 UTF-8 编码和 String 构造链路，char[] 的主体是 Kingbase 读库解码和 Jackson 的 UTF-16 缓冲，两类数组用途不同、不能互相换算。
 
-### 13.5 不要这样说
+### 13.5 如果面试官问“一个 74 MB 的响应怎么省出 400 多 MB”
+
+回答：
+
+> 424 MB 是两次堆峰值读数之差，不是某个对象的大小。JFR 逐次分配事件显示旧路径在同一个请求里累计多分配约 790 MB：每条大事件的 JSON 都被物化成 char[] 缓冲、UTF-16 展开、String 内部 byte[]、二次 UTF-8 编码等四五份整包拷贝，单条事件就要分配自身体积五六倍的临时数组；这些数组超过 G1 的 humongous 阈值（约 512 KB），Young GC 不回收，请求期间逐条叠加，峰值时刻仍驻留的部分就是 424 MB。快照对照看到的 293.5 MB 差额是 dump 那一刻仍驻留的子集。
+
+### 13.6 不要这样说
 
 - 不要说“直接写入不需要 UTF-8 编码”；
 - 不要说“所有 byte[] 都是地理数据”；
@@ -774,7 +802,7 @@ Wireshark / tcpdump 适合检查：
 - 不要说“byte[] 减少 239.8 MB，全部就是 String 内部数组”；
 - 不要把 2026-10-19 的 424 MB 峰值差说成精确释放的对象大小；
 - 不要把 2026-11-05 的对象快照构成直接套到 2026-10-19 的峰值上；
-- 没有检查 Spring 实际 converter 前，不要断言旧路径必然由某个指定 converter 处理。
+- 不要说“424 MB 就是省掉的一个 String”，JFR 已证明差额是四五类整包拷贝的叠加。
 
 ---
 
@@ -783,10 +811,10 @@ Wireshark / tcpdump 适合检查：
 把整个案例压缩成下面六句话：
 
 1. **String 是对象，String 内部通过 `byte[] value` 保存内容；String 对象浅堆不包含这个数组。**
-2. **Jackson 的 `TextBuffer` 等字符缓冲机制可能使用 `char[]`；但 Histogram 中所有 `char[]` 的来源不能仅凭类名确定。**
-3. **UTF-8 编码的结果是 `byte[]`，不是 String；String 内部的 byte[] 与 UTF-8 输出 byte[] 也不是同一概念。**
-4. **原来的 `writeValueAsString()` 先物化完整 JSON String；对象直传让 Spring/Jackson 可以直接在响应写出阶段序列化，避免完整 String 这一中间层。**
-5. **对象不可达不代表立即回收；连续分配的大数组可能在 GC 前累积，推高 Heap Used。**
-6. **Histogram 找类别，Dominator Tree 找支配者，Incoming References 找引用来源，JFR 找分配调用栈，抓包看网络传输；它们不能互相替代。**
+2. **`char[]` 的来源已被 JFR 逐栈证实：直接路径约 53 MB 来自 Kingbase 解码，旧路径额外约 135 MB 来自 Jackson `TextBuffer`；Histogram 的类名不能替代调用栈。**
+3. **UTF-8 编码的结果是 `byte[]`，不是 String；String 内部的 byte[] 与 `StringHttpMessageConverter` 二次编码的 byte[] 是两份不同的数组，后者约 293 MB，是最大单项。**
+4. **原来的 `writeValueAsString()` 每条大事件要整包拷贝四五份；对象直传让 Jackson 边序列化边写出，旧路径独有的三条栈全部消失，两条路径都只剩读库约 109 MB 的分配。**
+5. **对象不可达不代表立即回收；超过 G1 humongous 阈值的大数组不会被 Young GC 收走，会在请求期间叠加并推高 Heap Used。**
+6. **Histogram 找类别，Dominator Tree 找支配者，Incoming References 找引用来源，JFR `ObjectAllocationOutsideTLAB` 找精确分配调用栈（JDK 21 的 profile 默认关它，要手动开）；它们不能互相替代。**
 
-本次优化已经有可量化的数组总量差异。下一阶段的重点不是继续猜测，而是通过 Spring Converter 确认、JFR 分配栈和 MAT 引用链，把 `byte[]` 的 239.8 MB 差额进一步拆清楚。
+本案的归因链已经闭环：堆快照给出“少了两类数组共 293.5 MB”，JFR 分配栈给出“多分配的 790 MB 分别来自哪三条栈”，两者相互印证。剩余可做的是对象级引用链展开和峰值时刻快照，属于锦上添花。
